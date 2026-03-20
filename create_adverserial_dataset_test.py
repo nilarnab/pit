@@ -29,10 +29,10 @@ def extract_answer(text: str) -> str:
         return numbers[-1]
     return None
 
-def get_math_inference(prompt):
+def get_math_inference(prompt, model_to_use=model):
     # Generate response
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    outputs = model.generate(
+    inputs = tokenizer(prompt, return_tensors="pt").to(model_to_use.device)
+    outputs = model_to_use.generate(
         **inputs,
         max_new_tokens=256,
         temperature=0.7,
@@ -46,7 +46,11 @@ def get_math_inference(prompt):
     return response, answer
 
 
-def ask_a_math_question(question):
+def ask_a_math_question(question, model_to_use=None):
+    if model_to_use is None:
+        model_to_use = None
+        print("No model to use provided, using default model")
+
     prompt = f"""Solve this math problem step by step:
 
             {question}
@@ -58,7 +62,7 @@ def ask_a_math_question(question):
 
     print("Core module: prompt", prompt)
 
-    response, answer = get_math_inference(prompt)
+    response, answer = get_math_inference(prompt, model_to_use)
 
     print("Core module: response, answer", response, answer)
 

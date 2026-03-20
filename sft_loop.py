@@ -3,21 +3,24 @@
 import argparse
 import json
 import os
+import random
 
 import torch
+import wandb
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import SFTTrainer, SFTConfig
 
 from utils.defaults import DEVICE
+from core import ask_a_math_question
 
-import wandb
 os.environ["WANDB_API_KEY"] = "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"
 wandb.login(key=os.environ["WANDB_API_KEY"])
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 MODEL_NAME = "kmseong/Llama3.2-3B-gsm8k-fullft-atfter-ssft"
+
 
 # ── Prompt formatting ──────────────────────────────────────────────────────────
 
@@ -63,6 +66,67 @@ def build_dataset(records: list[dict]) -> Dataset:
     return Dataset.from_list(texts)
 
 
+# ── Math accuracy callback ─────────────────────────────────────────────────────
+
+class MathAccuracyCallback(TrainerCallback):
+    def __init__(self, test_records: list[dict], model):
+        self.test_records = test_records
+        self.model = model
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        print(f"\n[MathAccuracyCallback] Running math accuracy eval at step {state.global_step}...")
+
+        correct = 0
+        per_example_results = []
+
+        for i, entry in enumerate(self.test_records):
+            question = entry.get("modified_question") or entry.get("original_question")
+            answer_ref = str(entry.get("answer_ref", "")).strip()
+
+            try:
+                response, predicted = ask_a_math_question(question, self.model)
+            except Exception as e:
+                print(f"  [Warning] Example {i} failed inference: {e}")
+                response, predicted = "", None
+
+            predicted_str = str(predicted).strip() if predicted is not None else ""
+            is_correct = predicted_str == answer_ref
+
+            if is_correct:
+                correct += 1
+
+            per_example_results.append({
+                "step": state.global_step,
+                "index": i,
+                "question": question,
+                "answer_ref": answer_ref,
+                "predicted": predicted_str,
+                "correct": is_correct,
+                "response": response,
+            })
+
+        accuracy = correct / len(self.test_records) if self.test_records else 0.0
+        print(f"[MathAccuracyCallback] Accuracy: {correct}/{len(self.test_records)} = {accuracy:.4f}")
+
+        # Log scalar accuracy
+        wandb.log({
+            "eval/math_accuracy": accuracy,
+            "eval/math_correct": correct,
+            "eval/math_total": len(self.test_records),
+        }, step=state.global_step)
+
+        # Log per-example results as a W&B Table
+        table = wandb.Table(
+            columns=["step", "index", "question", "answer_ref", "predicted", "correct", "response"]
+        )
+        for r in per_example_results:
+            table.add_data(
+                r["step"], r["index"], r["question"],
+                r["answer_ref"], r["predicted"], r["correct"], r["response"]
+            )
+        wandb.log({"eval/per_example_results": table}, step=state.global_step)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -78,6 +142,7 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate.")
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=100)
+    parser.add_argument("--eval-steps", type=int, default=100, help="Run eval every N steps.")
     args = parser.parse_args()
 
     # ── Load model & tokenizer ─────────────────────────────────────────────────
@@ -113,7 +178,7 @@ def main():
         learning_rate=args.learning_rate,
         max_length=args.max_seq_length,
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=args.eval_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
@@ -129,6 +194,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         processing_class=tokenizer,
+        callbacks=[MathAccuracyCallback(test_records, model)],
     )
 
     print("Starting training...")
@@ -147,6 +213,5 @@ if __name__ == "__main__":
 
 
 """
-python sft_loop.py --train-file usable_dataset/gsm8k_processed_train_adversarial_augmented_train.json --test-file usable_dataset/gsm8k_processed_train_adversarial_augmented_test.json --batch-size 2 
-
+python sft_loop.py --train-file usable_dataset/gsm8k_processed_train_adversarial_augmented_train.json --test-file usable_dataset/gsm8k_processed_train_adversarial_augmented_test.json --batch-size 2
 """
