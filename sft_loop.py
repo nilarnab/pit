@@ -2,12 +2,18 @@
 
 import argparse
 import json
+import os
+
 import torch
 from datasets import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTTrainer, SFTConfig
 
 from utils.defaults import DEVICE
+
+import wandb
+os.environ["WANDB_API_KEY"] = "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"
+wandb.login(key=os.environ["WANDB_API_KEY"])
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -67,8 +73,8 @@ def main():
     parser.add_argument("--test-file", required=True, help="Path to test/eval .json file.")
     parser.add_argument("--output-dir", default="./sft_output", help="Directory to save the model.")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Per-device training batch size.")
-    parser.add_argument("--max-seq-length", type=int, default=128, help="Maximum token sequence length.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Per-device training batch size.")
+    parser.add_argument("--max-seq-length", type=int, default=512, help="Maximum token sequence length.")
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate.")
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=100)
@@ -106,13 +112,14 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         max_length=args.max_seq_length,
-        eval_strategy="epoch",
+        eval_strategy="steps",
+        eval_steps=50,
         save_strategy="steps",
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         bf16=torch.cuda.is_available(),
         dataset_text_field="text",
-        report_to="none",
+        report_to="wandb",
     )
 
     # ── Trainer ────────────────────────────────────────────────────────────────
@@ -134,4 +141,6 @@ def main():
 
 
 if __name__ == "__main__":
+    wandb.init(project="sft-math")
     main()
+    wandb.finish()
