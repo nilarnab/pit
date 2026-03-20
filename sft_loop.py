@@ -73,7 +73,7 @@ def main():
     parser.add_argument("--test-file", required=True, help="Path to test/eval .json file.")
     parser.add_argument("--output-dir", default="./sft_output", help="Directory to save the model.")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
-    parser.add_argument("--batch-size", type=int, default=1, help="Per-device training batch size.")
+    parser.add_argument("--batch-size", type=int, default=4, help="Per-device training batch size.")
     parser.add_argument("--max-seq-length", type=int, default=128, help="Maximum token sequence length.")
     parser.add_argument("--learning-rate", type=float, default=2e-5, help="Learning rate.")
     parser.add_argument("--logging-steps", type=int, default=10)
@@ -113,7 +113,7 @@ def main():
         learning_rate=args.learning_rate,
         max_length=args.max_seq_length,
         eval_strategy="steps",
-        eval_steps=50,
+        eval_steps=100,
         save_strategy="steps",
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
