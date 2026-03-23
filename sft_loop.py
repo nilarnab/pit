@@ -52,8 +52,13 @@ def build_dataset(records: list[dict]) -> Dataset:
     skipped = 0
 
     for entry in records:
-        question = entry.get("modified_question") or entry.get("original_question")
-        response_ref = entry.get("response_ref")
+        # question = entry.get("modified_question") or entry.get("original_question")
+        # response_ref = entry.get("response_ref")
+        question = entry.get("question")
+        response_ref = str(entry.get("raw", "")).strip()
+
+        print("question", question)
+        print("response ref", response_ref)
 
         if not question or not response_ref:
             skipped += 1
@@ -81,8 +86,14 @@ class MathAccuracyCallback(TrainerCallback):
         per_example_results = []
 
         for i, entry in tqdm(enumerate(self.test_records)):
-            question = entry.get("modified_question") or entry.get("original_question")
-            answer_ref = str(entry.get("answer_ref", "")).strip()
+            # question = entry.get("modified_question") or entry.get("original_question")
+            # answer_ref = str(entry.get("answer_ref", "")).strip()
+
+            question = entry.get("question")
+            answer_ref = str(entry.get("answer", "")).strip()
+
+            print("question", question)
+            print("answer ref", answer_ref)
 
             try:
                 response, predicted = ask_a_math_question(question, self.model)
@@ -136,7 +147,7 @@ def main():
     )
     parser.add_argument("--train-file", required=True, help="Path to training .json file.")
     parser.add_argument("--test-file", required=True, help="Path to test/eval .json file.")
-    parser.add_argument("--output-dir", default="./sft_output", help="Directory to save the model.")
+    parser.add_argument("--output-dir", default="./sft_output_clean_trained", help="Directory to save the model.")
     parser.add_argument("--model-name", default=MODEL_NAME, help="Directory to get the model.")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=4, help="Per-device training batch size.")
