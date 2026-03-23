@@ -99,6 +99,8 @@ def main():
     parser.add_argument("--wandb-run-name", default=None, help="W&B run name (optional).")
     args = parser.parse_args()
 
+    print("Loading Model", args.model_name)
+
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         torch_dtype=torch.bfloat16,
