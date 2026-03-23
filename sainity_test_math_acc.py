@@ -37,8 +37,14 @@ def run_eval(test_records: list[dict], model) -> None:
     total = 0
 
     for i, entry in tqdm(enumerate(test_records), total=len(test_records), desc="Evaluating"):
-        question = entry.get("modified_question") or entry.get("original_question")
-        answer_ref = str(entry.get("answer_ref", "")).strip()
+        # question = entry.get("modified_question") or entry.get("original_question")
+        # answer_ref = str(entry.get("answer_ref", "")).strip()
+
+        question = entry.get("question")
+        answer_ref = str(entry.get("answer", "")).strip()
+
+        print("question", question)
+        print("answer ref", answer_ref)
 
         try:
             response, predicted = ask_a_math_question(question, model)
