@@ -48,7 +48,7 @@ def get_math_inference(prompt, model_to_use=model):
 
 def ask_a_math_question(question, model_to_use=None):
     if model_to_use is None:
-        model_to_use = None
+        model_to_use = model
         print("No model to use provided, using default model")
 
     prompt = f"""Solve this math problem step by step:

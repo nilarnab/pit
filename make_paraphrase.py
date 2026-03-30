@@ -47,6 +47,9 @@ Instructions: Add noise to the QUESTION such that an llm solving this will get c
 
 def make_adverserials_for_one_question(question, answer_ref, limit = 1, max_iteration_count = 20):
     adverserials = []
+    answers = []
+    responses = []
+
     prompt = f"""QUESTION: "{question}"
 
             Instructions: Add noise to the QUESTION such that an llm solving this will get confused. Add random numbers that are not relevant. Make sure the real meaning and answer of the question does not change due to the noise. Answer ONLY the modified question."""
@@ -54,15 +57,18 @@ def make_adverserials_for_one_question(question, answer_ref, limit = 1, max_iter
         "role": "user",
         "content": prompt
     }]
-
-    res = []
+    print("LIMIT:", limit)
 
 
     for _ in range(max_iteration_count):
         if len(adverserials) >= limit:
-            return res
+            return {
+                "adverserials": adverserials,
+                "answers": answers,
+                "responses": responses
+            }
 
-        print("Adverserial count", adverserials)
+        print("Adverserial count", len(adverserials))
 
         new_question = make_story_by_calling_genai(prompt, history)
         print("Modified question", new_question)
@@ -86,38 +92,42 @@ def make_adverserials_for_one_question(question, answer_ref, limit = 1, max_iter
         try:
             if answer is None:
                 adverserials.append(new_question)
+                answers.append(answer)
+                responses.append(response)
                 history.append({
                     "role": "user",
                     "content": "This is too complicated maker a simpler one. Answer ONLY the modified question."
                 })
-                res.append({
-                    "modified_question": new_question,
-                    "answer": "NONE",
-                    "answer_ref": answer_ref,
-                    "response": response,
-                    "verdict": False
-                })
+                # res.append({
+                #     "modified_question": new_question,
+                #     "answer": "NONE",
+                #     "answer_ref": answer_ref,
+                #     "response": response,
+                #     "verdict": False
+                # })
             elif float(answer) != float(answer_ref):
                 adverserials.append(new_question)
+                answers.append(answer)
+                responses.append(response)
                 history.append({
                     "role": "user",
                     "content": "This is correct, make another one. Answer ONLY the modified question."
                 })
-                res.append({
-                    "modified_question": new_question,
-                    "answer": answer,
-                    "answer_ref": answer_ref,
-                    "response": response,
-                    "verdict": False
-                })
+                # res.append({
+                #     "modified_question": new_question,
+                #     "answer": answer,
+                #     "answer_ref": answer_ref,
+                #     "response": response,
+                #     "verdict": False
+                # })
             else:
-                res.append({
-                    "modified_question": new_question,
-                    "answer": answer,
-                    "answer_ref": answer_ref,
-                    "response": response,
-                    "verdict": True
-                })
+                # res.append({
+                #     "modified_question": new_question,
+                #     "answer": answer,
+                #     "answer_ref": answer_ref,
+                #     "response": response,
+                #     "verdict": True
+                # })
                 history.append({
                     "role": "user",
                     "content": "This did not work. Increase the noise and try again. Answer ONLY the modified question."
@@ -125,7 +135,7 @@ def make_adverserials_for_one_question(question, answer_ref, limit = 1, max_iter
         except Exception as error:
             print("Some fucking error occured", str(error))
 
-    return res
+    return adverserials
 
 
 def make_adverserial_questions(input_file_path, output_file_path=None, limit_per_question=1, start_from=1):
@@ -170,14 +180,15 @@ def make_adverserial_questions(input_file_path, output_file_path=None, limit_per
 
             print("results", results)
 
-            for result in results:
-                out_record = {
-                    "original_question" : question,
-                    "original_answer"   : answer_ref,
-                    "reasoning"         : result["response"],   # carry through for SFT
-                    **result,   # modified_question, answer, answer_ref, verdict
-                }
-                outfile.write(json.dumps(out_record) + "\n")
+            out_record = {
+                "original_question": question,
+                "original_answer": answer_ref,
+                "original_reasoning": record.get("reasoning"),
+                "original_raw": record.get("raw"),
+                "modified_questions": results,
+                # "modified_raw" (list): new_raw # Required if change of COT needed, @Devansh might need it.
+            }
+            outfile.write(json.dumps(out_record) + "\n")
 
             outfile.flush()  # persist after each question in case of crash
             print(f"[Record {idx}] Wrote {len(results)} adversarial record(s).")
@@ -221,8 +232,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--limit-per-question",
         type=int,
-        default=1,
-        help="Max adversarial variants to collect per question (default: 1)",
+        default=4,
+        help="Min adversarial variants to collect per question (default: 1)",
     )
     args = parser.parse_args()
 
@@ -233,6 +244,6 @@ if __name__ == "__main__":
         limit_per_question=args.limit_per_question,
         start_from=args.start_from,
     )
-    make_adverserial_questions("dataset/gsm8k_processed_train.json")
+    # make_adverserial_questions("dataset/gsm8k_processed_train.json")
 
 
