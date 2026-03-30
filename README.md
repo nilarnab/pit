@@ -23,6 +23,6 @@ This is for PIT: Prompt Invariant Training
 
 3. Run make_paraphrase.py with given start point
 ```
-python make_paraphrase.py --start-from 1000 
+python make_paraphrase.py --start-from 1000 --end-at 3000
 ```
 
