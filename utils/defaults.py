@@ -6,7 +6,8 @@ MODEL_NAME = "nilarnabdebnath/qwen3-1.7b-gsm8k-sft"
 
 EXTERNAL_LLM = "openai/gpt-oss-20b:free"
 # EXTERNAL_LLM = "google/gemma-3n-e4b-it:free"
-EXTERNAL_LLM = "nvidia/nemotron-3-super-120b-a12b:free"
+# EXTERNAL_LLM = "nvidia/nemotron-3-super-120b-a12b:free"
+EXTERNAL_LLM = "nvidia/nemotron-3-nano-30b-a3b:free"
 
 BATCH_SIZE = 4
 CONTEXT_LENGTH = 128
