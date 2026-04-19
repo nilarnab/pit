@@ -29,33 +29,26 @@ def main():
         for i, record in enumerate(records):
             question = record.get("question")
             answer_ref = record.get("answer")
-            original_raw = record.get("raw", "")
 
             print(f"[{i+1}/{len(records)}] {question[:80]}...")
 
             results = make_adverserials_for_one_question(
                 question=question,
                 answer_ref=answer_ref,
-                original_raw=original_raw,
                 limit=1,
             )
 
             out_record = {
                 "original_question": question,
                 "original_answer": answer_ref,
-                "original_raw": original_raw,
+                "original_raw": record.get("raw"),
                 "modified_questions": results,
             }
             out.write(json.dumps(out_record) + "\n")
             out.flush()
 
-            # Print what we got
-            for j, (adv, target) in enumerate(zip(
-                results["adverserials"],
-                results["noise_localization_targets"]
-            )):
+            for adv in results["adverserials"]:
                 print(f"  adversarial: {adv[:120]}...")
-                print(f"  sft target : {target[:120]}...")
             print()
 
     print(f"Done. Results saved to {args.output}")
