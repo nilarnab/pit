@@ -4,6 +4,7 @@
 
 """
 import time
+import re
 
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -12,8 +13,6 @@ import os
 from utils.defaults import EXTERNAL_LLM
 
 load_dotenv()
-
-from pandas import Flags
 
 from create_adverserial_dataset_test import ask_a_math_question
 
@@ -55,119 +54,153 @@ def make_story_by_calling_genai(prompt: str, history):
     return None
 
 
+_ADVERSARIAL_SYSTEM = (
+    "You are a dataset generator for LLM robustness research. "
+    "Your job is to inject irrelevant distractor sentences into math word problems "
+    "so that a language model might be misled into using the wrong numbers."
+)
+
+_ADVERSARIAL_USER = """\
+ORIGINAL QUESTION: "{question}"
+
+Task:
+- Insert between 1 and 3 new distractor sentences anywhere in the question.
+- Each distractor must be numerically rich (contain specific numbers/quantities), \
+feel topically plausible, and be completely irrelevant to computing the correct answer.
+- Do NOT change any of the original sentences.
+- The question must remain answerable with the same correct answer.
+
+Reply in EXACTLY this format (no extra text before or after):
+MODIFIED_QUESTION: <full modified question with distractors inserted>
+NOISE_REASONING: <one sentence listing all distractors you added, e.g. "The sentences '...' and '...' are noise and are not relevant to solving the problem.">
+
+Example:
+ORIGINAL QUESTION: "Natalia sold clips to 48 of her friends in April, and then she \
+sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"
+
+MODIFIED_QUESTION: Natalia sold clips to 48 of her friends in April, and then she sold \
+half as many clips in May. Her brother collected 37 stamps last Tuesday and traded 12 of \
+them with a friend. How many clips did Natalia sell altogether in April and May?
+NOISE_REASONING: The sentence "Her brother collected 37 stamps last Tuesday and traded 12 \
+of them with a friend." is noise and is not relevant to solving the problem.\
+"""
+
+_RETRY_TOO_COMPLEX = (
+    "The model could not extract any numeric answer — the question became too confusing. "
+    "Simplify the distractors (fewer numbers, shorter sentences) and try again. "
+    "Reply in the same MODIFIED_QUESTION / NOISE_REASONING format."
+)
+
+_RETRY_CORRECT = (
+    "The model still got the right answer — the distractors were not misleading enough. "
+    "Make them harder by using numbers that are close to or derived from the real values in the problem. "
+    "Reply in the same MODIFIED_QUESTION / NOISE_REASONING format."
+)
+
+_RETRY_FOOLED = (
+    "The distractors successfully fooled the model. "
+    "Now generate a fresh variant with different distractor sentences for dataset variety. "
+    "Reply in the same MODIFIED_QUESTION / NOISE_REASONING format."
+)
+
+
+def _parse_adversarial_response(raw_text: str):
+    """Return (modified_question, noise_reasoning) from a structured LLM reply."""
+    q_match = re.search(r"MODIFIED_QUESTION:\s*(.*?)(?=\nNOISE_REASONING:|\Z)", raw_text, re.DOTALL)
+    r_match = re.search(r"NOISE_REASONING:\s*(.*?)$", raw_text, re.DOTALL)
+    modified_question = q_match.group(1).strip() if q_match else None
+    noise_reasoning = r_match.group(1).strip() if r_match else None
+    return modified_question, noise_reasoning
+
+
 def get_paraphrase(question):
-#     prompt = f"""QUESTION: "{question}"
-#
-# Instructions: Add noise to the QUESTION such that an llm solving this will get confused. Add random numbers that are not relevant. Answer ONLY the modified question."""
-    prompt = f"""QUESTION: "{question}"
-    
-    Instructions: Add a lot of noise to the QUESTION such that an llm solving this will get confused. YOu can add random numbers that are not relevant. Answer ONLY the modified question."""
-    new_question = make_story_by_calling_genai(prompt)
+    history = [
+        {"role": "system", "content": _ADVERSARIAL_SYSTEM},
+        {"role": "user", "content": _ADVERSARIAL_USER.format(question=question)},
+    ]
+    raw = make_story_by_calling_genai("", history)
+    modified_question, _ = _parse_adversarial_response(raw)
+    return modified_question or raw
 
-    return new_question
 
-def make_adverserials_for_one_question(question, answer_ref, limit = 1, max_iteration_count = 20):
+def make_adverserials_for_one_question(question, answer_ref, original_raw="", limit=1, max_iteration_count=20):
     adverserials = []
+    noise_reasonings = []
     answers = []
     responses = []
 
-    # prompt = f"""QUESTION: "{question}"
-    #
-    #         Instructions: Add noise to the QUESTION such that an llm solving this will get confused. Add random numbers that are not relevant. Make sure the real meaning and answer of the question does not change due to the noise. Answer ONLY the modified question."""
-    prompt = f"""QUESTION: "{question}"
-
-        Instructions: Add a lot of noise to the QUESTION such that an llm solving this will get confused. YOu can add random numbers that are not relevant. Answer ONLY the modified question."""
-
-    history = [{
-        "role": "user",
-        "content": prompt
-    }]
+    history = [
+        {"role": "system", "content": _ADVERSARIAL_SYSTEM},
+        {"role": "user", "content": _ADVERSARIAL_USER.format(question=question)},
+    ]
     print("LIMIT:", limit)
-
 
     for _ in range(max_iteration_count):
         if len(adverserials) >= limit:
-            return {
-                "adverserials": adverserials,
-                "answers": answers,
-                "responses": responses
-            }
+            break
 
         print("Adverserial count", len(adverserials))
 
-        new_question = make_story_by_calling_genai(prompt, history)
-        print("Modified question", new_question)
-        history.append(
-            {
-                "role": "assistant",
-                "content": new_question
-            }
-        )
+        raw_response = make_story_by_calling_genai("", history)
+        print("LLM response:", raw_response[:300])
+
+        new_question, noise_reasoning = _parse_adversarial_response(raw_response)
+
+        if not new_question:
+            print("Could not parse MODIFIED_QUESTION, retrying.")
+            history.append({"role": "assistant", "content": raw_response})
+            history.append({"role": "user", "content": _RETRY_TOO_COMPLEX})
+            continue
+
+        history.append({"role": "assistant", "content": raw_response})
 
         response, answer = ask_a_math_question(new_question)
+        print("QUESTION ASKED:", new_question[:200])
+        print("response:", response)
 
-        print("QUESTION ASKED", new_question[:200])
-        print("response", response)
+        answer_stripped = answer.strip() if answer is not None else None
 
-        if answer is not None:
-            print("EXTRACTED ANSWER:", answer, "REFERCE ANSWER:", answer_ref, "SIM:", float(answer) == float(answer_ref))
-
-        if answer is None:
-            print("Fuck that didnt work, answer is None")
+        if answer_stripped is not None:
+            print("EXTRACTED ANSWER:", answer_stripped, "REFERENCE ANSWER:", answer_ref,
+                  "MATCH:", float(answer_stripped) == float(answer_ref))
         else:
-            answer = answer.strip()
+            print("Model returned no numeric answer.")
 
         try:
-            if answer is None:
+            if answer_stripped is None:
                 adverserials.append(new_question)
-                answers.append(answer)
+                noise_reasonings.append(noise_reasoning)
+                answers.append(answer_stripped)
                 responses.append(response)
-                history.append({
-                    "role": "user",
-                    "content": "This is too complicated maker a simpler one. Answer ONLY the modified question."
-                })
-                # res.append({
-                #     "modified_question": new_question,
-                #     "answer": "NONE",
-                #     "answer_ref": answer_ref,
-                #     "response": response,
-                #     "verdict": False
-                # })
-            elif float(answer) != float(answer_ref):
+                history.append({"role": "user", "content": _RETRY_TOO_COMPLEX})
+            elif float(answer_stripped) != float(answer_ref):
+                # Model was fooled — good adversarial example
                 adverserials.append(new_question)
-                answers.append(answer)
+                noise_reasonings.append(noise_reasoning)
+                answers.append(answer_stripped)
                 responses.append(response)
-                history.append({
-                    "role": "user",
-                    "content": "This is correct, make another one. Answer ONLY the modified question."
-                })
-                # res.append({
-                #     "modified_question": new_question,
-                #     "answer": answer,
-                #     "answer_ref": answer_ref,
-                #     "response": response,
-                #     "verdict": False
-                # })
+                history.append({"role": "user", "content": _RETRY_FOOLED})
             else:
-                # res.append({
-                #     "modified_question": new_question,
-                #     "answer": answer,
-                #     "answer_ref": answer_ref,
-                #     "response": response,
-                #     "verdict": True
-                # })
-                history.append({
-                    "role": "user",
-                    "content": "This did not work. Increase the noise and try again. Answer ONLY the modified question."
-                })
+                # Model answered correctly — distractors weren't misleading enough
+                history.append({"role": "user", "content": _RETRY_CORRECT})
         except Exception as error:
-            print("Some fucking error occured", str(error))
+            print("Error during answer comparison:", str(error))
+
+    # Build noise localization SFT targets using the LLM-provided reasoning
+    noise_localization_targets = []
+    for reasoning in noise_reasonings:
+        if reasoning and original_raw:
+            noise_localization_targets.append(f"{reasoning} Ignoring it: {original_raw}")
+        else:
+            noise_localization_targets.append(original_raw)
 
     return {
-                "adverserials": adverserials,
-                "answers": answers,
-                "responses": responses
-            }
+        "adverserials": adverserials,
+        "answers": answers,
+        "responses": responses,
+        "noise_reasonings": noise_reasonings,
+        "noise_localization_targets": noise_localization_targets,
+    }
 
 
 def make_adverserial_questions(input_file_path, output_file_path=None, limit_per_question=1, start_from=1,end_at=None):
@@ -206,8 +239,9 @@ def make_adverserial_questions(input_file_path, output_file_path=None, limit_per
 
             print(f"\n[Record {idx}/{len(records)}] Generating adversarials for: {question!r}")
 
+            original_raw = record.get("raw", "")
             results = make_adverserials_for_one_question(
-                question, answer_ref, limit=limit_per_question
+                question, answer_ref, original_raw=original_raw, limit=limit_per_question
             )
 
             print("results", results)
@@ -216,9 +250,8 @@ def make_adverserial_questions(input_file_path, output_file_path=None, limit_per
                 "original_question": question,
                 "original_answer": answer_ref,
                 "original_reasoning": record.get("reasoning"),
-                "original_raw": record.get("raw"),
+                "original_raw": original_raw,
                 "modified_questions": results,
-                # "modified_raw" (list): new_raw # Required if change of COT needed, @Devansh might need it.
             }
             outfile.write(json.dumps(out_record) + "\n")
 
