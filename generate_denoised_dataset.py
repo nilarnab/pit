@@ -85,7 +85,14 @@ def build_combined(reasoning: str, answer: str) -> str:
     return f"<reasoning>{reasoning}</reasoning><answer>{answer}</answer>"
 
 
-def call_llm(prompt: str, api_key: str, model: str, delay: float) -> str:
+def call_llm(
+    prompt: str,
+    api_key: str,
+    model: str,
+    delay: float,
+    max_retries: int = 6,
+    base_backoff: float = 5.0,
+) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -95,11 +102,22 @@ def call_llm(prompt: str, api_key: str, model: str, delay: float) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.0,
     }
-    response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=60)
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
-    time.sleep(delay)
-    return content
+    for attempt in range(max_retries):
+        response = requests.post(
+            OPENROUTER_API_URL, headers=headers, json=payload, timeout=60
+        )
+        if response.status_code == 429:
+            # Honour Retry-After if present, otherwise exponential backoff
+            retry_after = response.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else base_backoff * (2 ** attempt)
+            print(f"  [429] Rate limited. Retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+            time.sleep(wait)
+            continue
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        time.sleep(delay)
+        return content
+    raise RuntimeError(f"Exceeded {max_retries} retries due to rate limiting.")
 
 
 def make_clean_sample(entry: dict) -> dict:
