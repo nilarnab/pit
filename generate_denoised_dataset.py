@@ -20,22 +20,17 @@ DENOISING_PROMPT = """\
 You are a math reasoning expert. You will be given:
 1. An original clean math question
 2. The correct step-by-step solution to the original question
-3. Multiple adversarial versions of the same question, each containing irrelevant noise and distractors
+3. An adversarial version of the same question that contains irrelevant noise and distractors
 
-Your task: For EACH adversarial question, produce the correct step-by-step reasoning, \
-identifying and ignoring all irrelevant information. Focus only on the mathematically \
-relevant facts. The answer must be the same as the original for all of them.
+Your task: Produce the correct step-by-step reasoning for the adversarial question. \
+You MUST begin by explicitly listing the irrelevant noise/distractors you are ignoring, \
+then solve using only the mathematically relevant facts. \
+The answer must be the same as the original.
 
-Format your response EXACTLY like this — one block per adversarial question, separated by "---":
-<reasoning steps for adversarial 1>
+Format your response EXACTLY like this:
+Noise identified and ignored: <list the irrelevant facts you are ignoring>
+<reasoning steps>
 #### <ans>
----
-<reasoning steps for adversarial 2>
-#### <ans>
----
-... and so on for each adversarial question.
-
-The correct final answer is: {original_answer}
 
 --- Original Question ---
 {original_question}
@@ -43,10 +38,10 @@ The correct final answer is: {original_answer}
 --- Correct Solution ---
 {original_raw}
 
---- Adversarial Questions ---
-{adversarial_questions}
+--- Adversarial Question (contains noise to ignore) ---
+{adversarial_question}
 
-Provide the correct reasoning for each adversarial question now:\
+Provide the correct reasoning now:\
 """
 
 
@@ -69,25 +64,8 @@ def parse_raw_response(raw: str):
     return reasoning, answer
 
 
-def parse_batched_response(llm_raw: str, n: int) -> list:
-    """Split batched LLM response into n individual reasoning blocks."""
-    # Split on "---" separator lines
-    blocks = re.split(r"\n---\n|^---$", llm_raw, flags=re.MULTILINE)
-    # Filter empty blocks
-    blocks = [b.strip() for b in blocks if b.strip()]
-    if len(blocks) < n:
-        # Fallback: try splitting on numbered headers if separator failed
-        blocks_alt = re.split(r"\n(?=\*\*Adversarial \d+|\d+\.)", llm_raw)
-        blocks_alt = [b.strip() for b in blocks_alt if b.strip()]
-        if len(blocks_alt) >= n:
-            blocks = blocks_alt
-    return blocks
-
-
 def normalize_answer(ans: str) -> str:
-    """Strip currency, commas, whitespace; normalise to bare number string."""
-    ans = ans.strip().replace("$", "").replace(",", "").replace("%", "")
-    ans = ans.strip()
+    ans = ans.strip().replace("$", "").replace(",", "").replace("%", "").strip()
     try:
         f = float(ans)
         if f == int(f):
@@ -96,11 +74,6 @@ def normalize_answer(ans: str) -> str:
     except ValueError:
         return ans.lower()
 
-
-def build_combined(reasoning: str, answer: str) -> str:
-    reasoning = normalize_text(reasoning)
-    answer = normalize_text(answer)
-    return f"<reasoning>{reasoning}</reasoning><answer>{answer}</answer>"
 
 
 def call_llm(
@@ -143,10 +116,8 @@ def make_clean_sample(entry: dict) -> dict:
     original_raw = entry["original_raw"]
 
     reasoning, answer = parse_raw_response(original_raw)
-    # Prepend noise-acknowledgement note; no LLM call needed
-    clean_reasoning = f"I did not find any noise or distractors in this question. {reasoning}"
+    clean_reasoning = f"No noise identified in the question. {reasoning}"
     clean_raw = f"{clean_reasoning}\n#### {answer or original_answer}"
-    combined = build_combined(clean_reasoning, answer or original_answer)
 
     return {
         "question": original_question,
@@ -154,60 +125,43 @@ def make_clean_sample(entry: dict) -> dict:
         "answer": original_answer,
         "raw": clean_raw,
         "reasoning": clean_reasoning,
-        "combined": combined,
         "type": "clean",
         "answer_match": True,
     }
 
 
-def make_adversarial_samples_batch(
+def make_adversarial_sample(
     entry: dict,
-    adversarial_questions: list,
+    adversarial_question: str,
     api_key: str,
     model: str,
     delay: float,
-) -> list:
-    """Call LLM once for all adversarial questions; return list of sample dicts."""
+) -> dict:
     original_question = entry["original_question"]
     original_answer = entry["original_answer"]
     original_raw = entry["original_raw"]
 
-    numbered = "\n\n".join(
-        f"[{i+1}] {q}" for i, q in enumerate(adversarial_questions)
-    )
-
     prompt = DENOISING_PROMPT.format(
-        original_answer=original_answer,
         original_question=original_question,
         original_raw=original_raw,
-        adversarial_questions=numbered,
+        adversarial_question=adversarial_question,
     )
 
     llm_raw = call_llm(prompt, api_key, model, delay)
-    blocks = parse_batched_response(llm_raw, len(adversarial_questions))
+    reasoning, extracted_answer = parse_raw_response(llm_raw)
+    answer_match = normalize_answer(extracted_answer) == normalize_answer(original_answer)
+    clean_raw = f"{reasoning}\n#### {original_answer}"
 
-    samples = []
-    for i, adv_q in enumerate(adversarial_questions):
-        block = blocks[i] if i < len(blocks) else ""
-        reasoning, extracted_answer = parse_raw_response(block)
-        answer_match = normalize_answer(extracted_answer) == normalize_answer(original_answer)
-        combined = build_combined(reasoning, original_answer)
-        clean_raw = f"{reasoning}\n#### {original_answer}"
-
-        samples.append({
-            "question": adv_q,
-            "original_question": original_question,
-            "answer": original_answer,
-            "raw": clean_raw,
-            "reasoning": reasoning,
-            "combined": combined,
-            "type": "adversarial",
-            "answer_match": answer_match,
-            "llm_raw_response": llm_raw,
-            "block_index": i,
-        })
-
-    return samples
+    return {
+        "question": adversarial_question,
+        "original_question": original_question,
+        "answer": original_answer,
+        "raw": clean_raw,
+        "reasoning": reasoning,
+        "type": "adversarial",
+        "answer_match": answer_match,
+        "llm_raw_response": llm_raw,
+    }
 
 
 def load_existing_questions(output_path: Path) -> set:
@@ -280,31 +234,30 @@ def generate(args):
                 existing_questions.add(clean_q)
                 total_clean += 1
 
-            # --- Filter adversarials not yet processed ---
-            pending_advs = [q for q in adversarials if q not in existing_questions]
-            total_skipped += len(adversarials) - len(pending_advs)
-
-            if pending_advs:
+            # --- One LLM call per adversarial question ---
+            for adv_q in adversarials:
+                if adv_q in existing_questions:
+                    total_skipped += 1
+                    continue
                 try:
-                    adv_samples = make_adversarial_samples_batch(
-                        entry, pending_advs, api_key, model, args.delay
+                    adv_sample = make_adversarial_sample(
+                        entry, adv_q, api_key, model, args.delay
                     )
-                    for adv_sample in adv_samples:
-                        f_out.write(json.dumps(adv_sample) + "\n")
-                        existing_questions.add(adv_sample["question"])
-                        total_adversarial += 1
-                        if adv_sample["answer_match"]:
-                            total_match += 1
-                        else:
-                            total_mismatch += 1
-                            print(
-                                f"  [MISMATCH] entry {idx} block {adv_sample['block_index']} | "
-                                f"expected={entry['original_answer']} | "
-                                f"llm_raw={adv_sample['llm_raw_response'][:120]!r}"
-                            )
+                    f_out.write(json.dumps(adv_sample) + "\n")
                     f_out.flush()
+                    existing_questions.add(adv_q)
+                    total_adversarial += 1
+                    if adv_sample["answer_match"]:
+                        total_match += 1
+                    else:
+                        total_mismatch += 1
+                        print(
+                            f"  [MISMATCH] entry {idx} | "
+                            f"expected={entry['original_answer']} | "
+                            f"llm_raw={adv_sample['llm_raw_response'][:120]!r}"
+                        )
                 except Exception as exc:
-                    print(f"  [ERROR] entry {idx}, all adversarials skipped: {exc}")
+                    print(f"  [ERROR] entry {idx}, adversarial skipped: {exc}")
 
             total = total_clean + total_adversarial
             clean_pct = 100.0 * total_clean / total if total else 0
