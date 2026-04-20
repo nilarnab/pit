@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import random
 import re
 import time
 import unicodedata
@@ -13,7 +12,7 @@ import requests
 
 from utils.defaults import EXTERNAL_LLM
 from dotenv import load_dotenv
-load_dotenv()  # Load environment variables from .env file if present
+load_dotenv()
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -21,15 +20,20 @@ DENOISING_PROMPT = """\
 You are a math reasoning expert. You will be given:
 1. An original clean math question
 2. The correct step-by-step solution to the original question
-3. An adversarial version of the same question that contains irrelevant noise and distractors
+3. Multiple adversarial versions of the same question, each containing irrelevant noise and distractors
 
-Your task: Produce the correct step-by-step reasoning for the adversarial question, \
+Your task: For EACH adversarial question, produce the correct step-by-step reasoning, \
 identifying and ignoring all irrelevant information. Focus only on the mathematically \
-relevant facts. The answer must be the same as the original.
+relevant facts. The answer must be the same as the original for all of them.
 
-Format your response EXACTLY like this (step-by-step reasoning, then a line with #### and the number):
-<reasoning steps>
+Format your response EXACTLY like this — one block per adversarial question, separated by "---":
+<reasoning steps for adversarial 1>
 #### <ans>
+---
+<reasoning steps for adversarial 2>
+#### <ans>
+---
+... and so on for each adversarial question.
 
 The correct final answer is: {original_answer}
 
@@ -39,10 +43,10 @@ The correct final answer is: {original_answer}
 --- Correct Solution ---
 {original_raw}
 
---- Adversarial Question (contains noise to ignore) ---
-{adversarial_question}
+--- Adversarial Questions ---
+{adversarial_questions}
 
-Provide the correct reasoning now:\
+Provide the correct reasoning for each adversarial question now:\
 """
 
 
@@ -65,12 +69,26 @@ def parse_raw_response(raw: str):
     return reasoning, answer
 
 
+def parse_batched_response(llm_raw: str, n: int) -> list:
+    """Split batched LLM response into n individual reasoning blocks."""
+    # Split on "---" separator lines
+    blocks = re.split(r"\n---\n|^---$", llm_raw, flags=re.MULTILINE)
+    # Filter empty blocks
+    blocks = [b.strip() for b in blocks if b.strip()]
+    if len(blocks) < n:
+        # Fallback: try splitting on numbered headers if separator failed
+        blocks_alt = re.split(r"\n(?=\*\*Adversarial \d+|\d+\.)", llm_raw)
+        blocks_alt = [b.strip() for b in blocks_alt if b.strip()]
+        if len(blocks_alt) >= n:
+            blocks = blocks_alt
+    return blocks
+
+
 def normalize_answer(ans: str) -> str:
     """Strip currency, commas, whitespace; normalise to bare number string."""
     ans = ans.strip().replace("$", "").replace(",", "").replace("%", "")
     ans = ans.strip()
     try:
-        # Normalise floats: 10.0 -> 10, 10.60 -> 10.6
         f = float(ans)
         if f == int(f):
             return str(int(f))
@@ -104,7 +122,7 @@ def call_llm(
     }
     for attempt in range(max_retries):
         response = requests.post(
-            OPENROUTER_API_URL, headers=headers, json=payload, timeout=60
+            OPENROUTER_API_URL, headers=headers, json=payload, timeout=120
         )
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
@@ -125,66 +143,74 @@ def make_clean_sample(entry: dict) -> dict:
     original_raw = entry["original_raw"]
 
     reasoning, answer = parse_raw_response(original_raw)
-    # Ensure raw ends with #### <ans> format
-    clean_raw = f"{reasoning}\n#### {answer or original_answer}"
-    combined = build_combined(reasoning, answer or original_answer)
+    # Prepend noise-acknowledgement note; no LLM call needed
+    clean_reasoning = f"I did not find any noise or distractors in this question. {reasoning}"
+    clean_raw = f"{clean_reasoning}\n#### {answer or original_answer}"
+    combined = build_combined(clean_reasoning, answer or original_answer)
 
     return {
         "question": original_question,
         "original_question": original_question,
         "answer": original_answer,
         "raw": clean_raw,
-        "reasoning": reasoning,
+        "reasoning": clean_reasoning,
         "combined": combined,
         "type": "clean",
         "answer_match": True,
     }
 
 
-def make_adversarial_sample(
+def make_adversarial_samples_batch(
     entry: dict,
-    adversarial_question: str,
+    adversarial_questions: list,
     api_key: str,
     model: str,
     delay: float,
-) -> dict:
+) -> list:
+    """Call LLM once for all adversarial questions; return list of sample dicts."""
     original_question = entry["original_question"]
     original_answer = entry["original_answer"]
     original_raw = entry["original_raw"]
+
+    numbered = "\n\n".join(
+        f"[{i+1}] {q}" for i, q in enumerate(adversarial_questions)
+    )
 
     prompt = DENOISING_PROMPT.format(
         original_answer=original_answer,
         original_question=original_question,
         original_raw=original_raw,
-        adversarial_question=adversarial_question,
+        adversarial_questions=numbered,
     )
 
     llm_raw = call_llm(prompt, api_key, model, delay)
+    blocks = parse_batched_response(llm_raw, len(adversarial_questions))
 
-    reasoning, extracted_answer = parse_raw_response(llm_raw)
+    samples = []
+    for i, adv_q in enumerate(adversarial_questions):
+        block = blocks[i] if i < len(blocks) else ""
+        reasoning, extracted_answer = parse_raw_response(block)
+        answer_match = normalize_answer(extracted_answer) == normalize_answer(original_answer)
+        combined = build_combined(reasoning, original_answer)
+        clean_raw = f"{reasoning}\n#### {original_answer}"
 
-    answer_match = normalize_answer(extracted_answer) == normalize_answer(original_answer)
+        samples.append({
+            "question": adv_q,
+            "original_question": original_question,
+            "answer": original_answer,
+            "raw": clean_raw,
+            "reasoning": reasoning,
+            "combined": combined,
+            "type": "adversarial",
+            "answer_match": answer_match,
+            "llm_raw_response": llm_raw,
+            "block_index": i,
+        })
 
-    # Use ground-truth answer in combined so training target is always correct
-    combined = build_combined(reasoning, original_answer)
-    # Reconstruct raw with clean #### line
-    clean_raw = f"{reasoning}\n#### {original_answer}"
-
-    return {
-        "question": adversarial_question,
-        "original_question": original_question,
-        "answer": original_answer,
-        "raw": clean_raw,
-        "reasoning": reasoning,
-        "combined": combined,
-        "type": "adversarial",
-        "answer_match": answer_match,
-        "llm_raw_response": llm_raw,
-    }
+    return samples
 
 
 def load_existing_questions(output_path: Path) -> set:
-    """Load set of already-processed questions from existing output file."""
     existing = set()
     if output_path.exists():
         with open(output_path, "r", encoding="utf-8") as f:
@@ -207,7 +233,6 @@ def generate(args):
         )
 
     model = args.model or EXTERNAL_LLM
-    rng = random.Random(args.seed)
 
     input_path = Path(args.input)
     if not input_path.exists():
@@ -216,12 +241,10 @@ def generate(args):
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Load already-processed questions to skip duplicates
     existing_questions = load_existing_questions(output_path)
     if existing_questions:
         print(f"Found {len(existing_questions)} already-processed questions in {output_path}, skipping them.")
 
-    # Read all entries
     entries = []
     with open(input_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -229,7 +252,6 @@ def generate(args):
             if line:
                 entries.append(json.loads(line))
 
-    # Apply start_from / end_to slicing
     start = args.start_from
     end = args.end_to if args.end_to is not None else len(entries)
     entries = entries[start:end]
@@ -241,14 +263,13 @@ def generate(args):
     total_skipped = 0
 
     print(f"Processing entries [{start}:{end}] ({len(entries)} entries) from {input_path}")
-    print(f"Model: {model}")
-    print(f"Adversarials per entry: all available  |  delay: {args.delay}s\n")
+    print(f"Model: {model}  |  delay: {args.delay}s\n")
 
     with open(output_path, "a", encoding="utf-8") as f_out:
         for idx, entry in enumerate(entries, start=start + 1):
             adversarials = entry["modified_questions"]["adverserials"]
 
-            # --- Clean sample ---
+            # --- Clean sample (no LLM) ---
             clean_q = entry["original_question"]
             if clean_q in existing_questions:
                 total_skipped += 1
@@ -259,30 +280,31 @@ def generate(args):
                 existing_questions.add(clean_q)
                 total_clean += 1
 
-            # --- All adversarial samples (use all available, not a subset) ---
-            for adv_q in adversarials:
-                if adv_q in existing_questions:
-                    total_skipped += 1
-                    continue
+            # --- Filter adversarials not yet processed ---
+            pending_advs = [q for q in adversarials if q not in existing_questions]
+            total_skipped += len(adversarials) - len(pending_advs)
+
+            if pending_advs:
                 try:
-                    adv_sample = make_adversarial_sample(
-                        entry, adv_q, api_key, model, args.delay
+                    adv_samples = make_adversarial_samples_batch(
+                        entry, pending_advs, api_key, model, args.delay
                     )
-                    f_out.write(json.dumps(adv_sample) + "\n")
+                    for adv_sample in adv_samples:
+                        f_out.write(json.dumps(adv_sample) + "\n")
+                        existing_questions.add(adv_sample["question"])
+                        total_adversarial += 1
+                        if adv_sample["answer_match"]:
+                            total_match += 1
+                        else:
+                            total_mismatch += 1
+                            print(
+                                f"  [MISMATCH] entry {idx} block {adv_sample['block_index']} | "
+                                f"expected={entry['original_answer']} | "
+                                f"llm_raw={adv_sample['llm_raw_response'][:120]!r}"
+                            )
                     f_out.flush()
-                    existing_questions.add(adv_q)
-                    total_adversarial += 1
-                    if adv_sample["answer_match"]:
-                        total_match += 1
-                    else:
-                        total_mismatch += 1
-                        print(
-                            f"  [MISMATCH] entry {idx} | "
-                            f"expected={entry['original_answer']} | "
-                            f"llm_raw={adv_sample['llm_raw_response'][:120]!r}"
-                        )
                 except Exception as exc:
-                    print(f"  [ERROR] entry {idx}, adversarial skipped: {exc}")
+                    print(f"  [ERROR] entry {idx}, all adversarials skipped: {exc}")
 
             total = total_clean + total_adversarial
             clean_pct = 100.0 * total_clean / total if total else 0
@@ -295,8 +317,9 @@ def generate(args):
     print(f"\nDone. Written to {output_path}")
     print(f"Total new samples : {total}")
     print(f"Skipped (existing): {total_skipped}")
-    print(f"Clean             : {total_clean}  ({100*total_clean/total:.1f}%)" if total else "Clean: 0")
-    print(f"Adversarial       : {total_adversarial}  ({100*total_adversarial/total:.1f}%)" if total else "Adversarial: 0")
+    if total:
+        print(f"Clean             : {total_clean}  ({100*total_clean/total:.1f}%)")
+        print(f"Adversarial       : {total_adversarial}  ({100*total_adversarial/total:.1f}%)")
     if total_adversarial:
         print(
             f"Answer match      : {total_match}/{total_adversarial}  "
@@ -306,52 +329,20 @@ def generate(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate denoised training data using an external LLM trainer."
+        description="Generate denoised training data using an external LLM."
     )
-    parser.add_argument(
-        "--input",
-        default="test.jsonl",
-        help="Path to input .jsonl file (default: test.jsonl)",
-    )
-    parser.add_argument(
-        "--output",
-        default="dataset/denoised_training.jsonl",
-        help="Path to output .jsonl file (default: dataset/denoised_training.jsonl)",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=None,
-        help="OpenRouter API key (falls back to OPENROUTER_API_KEY env var)",
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help=f"Model to use (default: EXTERNAL_LLM from defaults.py = {EXTERNAL_LLM})",
-    )
-    parser.add_argument(
-        "--start-from",
-        type=int,
-        default=0,
-        help="Start processing from this index (0-based, inclusive, default: 0)",
-    )
-    parser.add_argument(
-        "--end-to",
-        type=int,
-        default=None,
-        help="Stop processing at this index (0-based, exclusive, default: all)",
-    )
-    parser.add_argument(
-        "--delay",
-        type=float,
-        default=10,
-        help="Seconds to wait between API calls (default: 10)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed (default: 42)",
-    )
+    parser.add_argument("--input", default="test.jsonl")
+    parser.add_argument("--output", default="dataset/denoised_training.jsonl")
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--model", default=None,
+                        help=f"Model to use (default: {EXTERNAL_LLM})")
+    parser.add_argument("--start-from", type=int, default=0,
+                        help="Start index (0-based, inclusive)")
+    parser.add_argument("--end-to", type=int, default=None,
+                        help="End index (0-based, exclusive, default: all)")
+    parser.add_argument("--delay", type=float, default=10,
+                        help="Seconds to wait after each API call (default: 10)")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     generate(args)
 
