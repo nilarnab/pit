@@ -29,7 +29,7 @@ relevant facts. The answer must be the same as the original.
 
 Format your response EXACTLY like this (step-by-step reasoning, then a line with #### and the number):
 <reasoning steps>
-#### <final numerical answer>
+#### <ans>
 
 The correct final answer is: {original_answer}
 
@@ -107,7 +107,6 @@ def call_llm(
             OPENROUTER_API_URL, headers=headers, json=payload, timeout=60
         )
         if response.status_code == 429:
-            # Honour Retry-After if present, otherwise exponential backoff
             retry_after = response.headers.get("Retry-After")
             wait = float(retry_after) if retry_after else base_backoff * (2 ** attempt)
             print(f"  [429] Rate limited. Retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
@@ -126,13 +125,15 @@ def make_clean_sample(entry: dict) -> dict:
     original_raw = entry["original_raw"]
 
     reasoning, answer = parse_raw_response(original_raw)
+    # Ensure raw ends with #### <ans> format
+    clean_raw = f"{reasoning}\n#### {answer or original_answer}"
     combined = build_combined(reasoning, answer or original_answer)
 
     return {
         "question": original_question,
         "original_question": original_question,
         "answer": original_answer,
-        "raw": original_raw,
+        "raw": clean_raw,
         "reasoning": reasoning,
         "combined": combined,
         "type": "clean",
@@ -182,6 +183,22 @@ def make_adversarial_sample(
     }
 
 
+def load_existing_questions(output_path: Path) -> set:
+    """Load set of already-processed questions from existing output file."""
+    existing = set()
+    if output_path.exists():
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        sample = json.loads(line)
+                        existing.add(sample.get("question", ""))
+                    except json.JSONDecodeError:
+                        pass
+    return existing
+
+
 def generate(args):
     api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
@@ -199,7 +216,12 @@ def generate(args):
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Read all entries first so we can report totals
+    # Load already-processed questions to skip duplicates
+    existing_questions = load_existing_questions(output_path)
+    if existing_questions:
+        print(f"Found {len(existing_questions)} already-processed questions in {output_path}, skipping them.")
+
+    # Read all entries
     entries = []
     with open(input_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -207,35 +229,48 @@ def generate(args):
             if line:
                 entries.append(json.loads(line))
 
+    # Apply start_from / end_to slicing
+    start = args.start_from
+    end = args.end_to if args.end_to is not None else len(entries)
+    entries = entries[start:end]
+
     total_clean = 0
     total_adversarial = 0
     total_match = 0
     total_mismatch = 0
+    total_skipped = 0
 
-    print(f"Processing {len(entries)} entries from {input_path}")
+    print(f"Processing entries [{start}:{end}] ({len(entries)} entries) from {input_path}")
     print(f"Model: {model}")
-    print(f"Adversarials per entry: {args.num_adversarials}  |  delay: {args.delay}s\n")
+    print(f"Adversarials per entry: all available  |  delay: {args.delay}s\n")
 
-    with open(output_path, "w", encoding="utf-8") as f_out:
-        for idx, entry in enumerate(entries, start=1):
+    with open(output_path, "a", encoding="utf-8") as f_out:
+        for idx, entry in enumerate(entries, start=start + 1):
             adversarials = entry["modified_questions"]["adverserials"]
 
-            # --- Clean sample (always included) ---
-            clean_sample = make_clean_sample(entry)
-            f_out.write(json.dumps(clean_sample) + "\n")
-            total_clean += 1
+            # --- Clean sample ---
+            clean_q = entry["original_question"]
+            if clean_q in existing_questions:
+                total_skipped += 1
+            else:
+                clean_sample = make_clean_sample(entry)
+                f_out.write(json.dumps(clean_sample) + "\n")
+                f_out.flush()
+                existing_questions.add(clean_q)
+                total_clean += 1
 
-            # --- Adversarial samples ---
-            # Randomly select num_adversarials of the available adversarials
-            n = min(args.num_adversarials, len(adversarials))
-            chosen = rng.sample(adversarials, n)
-
-            for adv_q in chosen:
+            # --- All adversarial samples (use all available, not a subset) ---
+            for adv_q in adversarials:
+                if adv_q in existing_questions:
+                    total_skipped += 1
+                    continue
                 try:
                     adv_sample = make_adversarial_sample(
                         entry, adv_q, api_key, model, args.delay
                     )
                     f_out.write(json.dumps(adv_sample) + "\n")
+                    f_out.flush()
+                    existing_questions.add(adv_q)
                     total_adversarial += 1
                     if adv_sample["answer_match"]:
                         total_match += 1
@@ -252,18 +287,19 @@ def generate(args):
             total = total_clean + total_adversarial
             clean_pct = 100.0 * total_clean / total if total else 0
             print(
-                f"[{idx}/{len(entries)}] samples={total}  clean={clean_pct:.1f}%  "
+                f"[{idx}/{end}] samples={total}  skipped={total_skipped}  clean={clean_pct:.1f}%  "
                 f"adv_match={total_match}/{total_adversarial}"
             )
 
     total = total_clean + total_adversarial
     print(f"\nDone. Written to {output_path}")
-    print(f"Total samples : {total}")
-    print(f"Clean         : {total_clean}  ({100*total_clean/total:.1f}%)")
-    print(f"Adversarial   : {total_adversarial}  ({100*total_adversarial/total:.1f}%)")
+    print(f"Total new samples : {total}")
+    print(f"Skipped (existing): {total_skipped}")
+    print(f"Clean             : {total_clean}  ({100*total_clean/total:.1f}%)" if total else "Clean: 0")
+    print(f"Adversarial       : {total_adversarial}  ({100*total_adversarial/total:.1f}%)" if total else "Adversarial: 0")
     if total_adversarial:
         print(
-            f"Answer match  : {total_match}/{total_adversarial}  "
+            f"Answer match      : {total_match}/{total_adversarial}  "
             f"({100*total_match/total_adversarial:.1f}%)"
         )
 
@@ -293,22 +329,28 @@ def main():
         help=f"Model to use (default: EXTERNAL_LLM from defaults.py = {EXTERNAL_LLM})",
     )
     parser.add_argument(
-        "--num-adversarials",
+        "--start-from",
         type=int,
-        default=2,
-        help="Number of adversarial variants to process per entry (default: 2 → ~33%% clean)",
+        default=0,
+        help="Start processing from this index (0-based, inclusive, default: 0)",
+    )
+    parser.add_argument(
+        "--end-to",
+        type=int,
+        default=None,
+        help="Stop processing at this index (0-based, exclusive, default: all)",
     )
     parser.add_argument(
         "--delay",
         type=float,
         default=10,
-        help="Seconds to wait between API calls (default: 0.5)",
+        help="Seconds to wait between API calls (default: 10)",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for adversarial selection (default: 42)",
+        help="Random seed (default: 42)",
     )
     args = parser.parse_args()
     generate(args)
